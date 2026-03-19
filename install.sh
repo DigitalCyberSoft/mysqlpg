@@ -63,33 +63,47 @@ create_symlinks() {
         mysqldumppg_bin="$pip_bin_dir/mysqldumppg"
     fi
 
-    # Check if real mysql/mysqldump already exist
-    local existing_mysql existing_dump
-    existing_mysql="$(command -v mysql 2>/dev/null || true)"
-    existing_dump="$(command -v mysqldump 2>/dev/null || true)"
+    # Helper: check if a command exists and is NOT one of our symlinks
+    is_real_binary() {
+        local cmd="$1"
+        local found
+        found="$(command -v "$cmd" 2>/dev/null || true)"
+        [ -z "$found" ] && return 1  # not found at all
+
+        # If it's a symlink, check if it points to mysqlpg/mysqldumppg (ours)
+        if [ -L "$found" ]; then
+            local target
+            target="$(readlink -f "$found" 2>/dev/null || readlink "$found")"
+            if [[ "$target" == *mysqlpg* ]] || [[ "$target" == *mysqldumppg* ]]; then
+                return 1  # it's our own symlink, not a real binary
+            fi
+        fi
+        return 0  # real binary exists
+    }
 
     # Create mysql symlink
-    if [ -n "$existing_mysql" ] && [ ! -L "$existing_mysql" ]; then
-        echo "WARNING: Real MySQL client found at $existing_mysql"
+    if is_real_binary mysql; then
+        local found_mysql
+        found_mysql="$(command -v mysql)"
+        echo "WARNING: mysql already exists at $found_mysql"
         echo "  Skipping 'mysql' symlink to avoid conflict."
         echo "  Use 'mysqlpg' directly instead."
     else
-        if [ -L "$bin_dir/mysql" ]; then
-            rm "$bin_dir/mysql"
-        fi
+        # Remove stale symlink if present
+        [ -L "$bin_dir/mysql" ] && rm "$bin_dir/mysql"
         ln -s "$mysqlpg_bin" "$bin_dir/mysql"
         echo "Created symlink: $bin_dir/mysql -> $mysqlpg_bin"
     fi
 
     # Create mysqldump symlink
-    if [ -n "$existing_dump" ] && [ ! -L "$existing_dump" ]; then
-        echo "WARNING: Real mysqldump found at $existing_dump"
+    if is_real_binary mysqldump; then
+        local found_dump
+        found_dump="$(command -v mysqldump)"
+        echo "WARNING: mysqldump already exists at $found_dump"
         echo "  Skipping 'mysqldump' symlink to avoid conflict."
         echo "  Use 'mysqldumppg' directly instead."
     elif [ -n "$mysqldumppg_bin" ]; then
-        if [ -L "$bin_dir/mysqldump" ]; then
-            rm "$bin_dir/mysqldump"
-        fi
+        [ -L "$bin_dir/mysqldump" ] && rm "$bin_dir/mysqldump"
         ln -s "$mysqldumppg_bin" "$bin_dir/mysqldump"
         echo "Created symlink: $bin_dir/mysqldump -> $mysqldumppg_bin"
     fi
