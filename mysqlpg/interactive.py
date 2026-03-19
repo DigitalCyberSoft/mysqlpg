@@ -164,12 +164,9 @@ def run_interactive(conn, formatter, state, args):
 
             line = session.prompt(prompt_str)
         except KeyboardInterrupt:
-            if buffer:
-                buffer = ""
-                print()
-                continue
-            print()
-            continue
+            print("\nBye")
+            state["exit"] = True
+            return
         except EOFError:
             print("\nBye")
             break
