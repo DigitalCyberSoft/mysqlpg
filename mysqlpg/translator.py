@@ -256,10 +256,19 @@ def _translate_functions(sql):
     )
 
     # YEAR(col) → EXTRACT(YEAR FROM col)
+    # But NOT YEAR(4) as a type definition — skip if arg is a small integer literal
     for unit in ('YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND'):
+        def _make_extract_rewriter(u):
+            def _rewrite(m):
+                arg = m.group(1).strip()
+                # Skip if it's a type-width integer (e.g., YEAR(4), DAY(2))
+                if re.match(r'^\d{1,2}$', arg):
+                    return m.group(0)
+                return f'EXTRACT({u} FROM {arg})'
+            return _rewrite
         sql = re.sub(
             rf'\b{unit}\s*\(([^)]+)\)',
-            rf'EXTRACT({unit} FROM \1)',
+            _make_extract_rewriter(unit),
             sql, flags=re.IGNORECASE
         )
 
@@ -1412,7 +1421,7 @@ def _translate_mysql_ddl(sql):
     """Convert MySQL CREATE TABLE DDL to PostgreSQL-compatible DDL."""
     # Extract table name
     m = re.match(
-        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([`\"\w]+)\s*\(",
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([`\"\w\-\.]+)\s*\(",
         sql, re.IGNORECASE
     )
     if not m:
@@ -1469,6 +1478,14 @@ def _translate_mysql_ddl(sql):
                 pg_defs.append(f"UNIQUE ({_convert_backticks(cols)})")
             else:
                 pg_defs.append(_convert_backticks(d))
+            continue
+
+        # FULLTEXT KEY → skip (PG needs GIN/tsvector, not a simple index)
+        if upper.startswith("FULLTEXT"):
+            continue
+
+        # SPATIAL KEY → skip (PG needs PostGIS/GIST index)
+        if upper.startswith("SPATIAL"):
             continue
 
         # KEY (non-unique index) → handled as CREATE INDEX after
@@ -1710,6 +1727,9 @@ _TRANSLATORS = [
     (re.compile(r"SET\s+@?\w*CHARACTER_SET\w*\s*=", _i), _noop_ok),
     (re.compile(r"SET\s+@?\w*COLLATION\w*\s*=", _i), _noop_ok),
 
+    # SET @saved_... = ... (MySQL dump checkpoint variables)
+    (re.compile(r"SET\s+@\w+\s*=\s*@@", _i), _noop_ok),
+
     # LOCK TABLES
     (re.compile(r"LOCK\s+TABLES\s+", _i), _lock_tables),
 
@@ -1721,7 +1741,7 @@ _TRANSLATORS = [
 
     # MySQL-style CREATE TABLE with MySQL types (detected by ENGINE= or AUTO_INCREMENT)
     (re.compile(
-        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`\"\w]+\s*\(.*\)\s*"
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`\"\w\-\.]+\s*\(.*\)\s*"
         r"(?:ENGINE\s*=|AUTO_INCREMENT\s*=|DEFAULT\s+CHARSET)",
         _i | re.DOTALL
     ), _mysql_create_table),
