@@ -164,6 +164,12 @@ def run_interactive(conn, formatter, state, args):
 
             line = session.prompt(prompt_str)
         except KeyboardInterrupt:
+            # Ctrl+C at the prompt (no query running) → exit
+            if buffer:
+                # If mid-input, just clear buffer
+                buffer = ""
+                print("\n^C")
+                continue
             print("\nBye")
             state["exit"] = True
             return
@@ -275,5 +281,12 @@ def _process_buffer(sql, conn, formatter, state, vertical_override):
                     notices = conn.pop_notices()
                     for n in notices:
                         formatter.print_message(n)
+    except KeyboardInterrupt:
+        # Ctrl+C during query execution — cancel and return to prompt
+        try:
+            conn.conn.cancel()
+        except Exception:
+            pass
+        formatter.print_message("^C — query cancelled")
     except Exception as e:
         formatter.print_message(f"ERROR: {e}")
