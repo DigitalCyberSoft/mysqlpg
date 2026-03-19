@@ -3,60 +3,138 @@
 # install.sh — Install mysqlpg & mysqldumppg
 #
 # Usage:
-#   ./install.sh              # Install + add aliases
-#   ./install.sh --no-alias   # Install without aliases
-#   ./install.sh --uninstall  # Remove package and aliases
+#   ./install.sh              # Install + create mysql/mysqldump symlinks
+#   ./install.sh --no-alias   # Install without symlinks
+#   ./install.sh --uninstall  # Remove package and symlinks
 #
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ALIAS_MARKER="# mysqlpg aliases"
-SHELL_RC=""
 
-# Detect shell rc file
-detect_shell_rc() {
-    if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "${SHELL:-}")" = "zsh" ]; then
-        SHELL_RC="$HOME/.zshrc"
+# Determine the right bin directory for symlinks
+get_bin_dir() {
+    # If running as root, use system-wide path
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "/usr/local/bin"
     else
-        SHELL_RC="$HOME/.bashrc"
+        # User-local: prefer ~/.local/bin (standard), create if needed
+        local user_bin="$HOME/.local/bin"
+        mkdir -p "$user_bin"
+        echo "$user_bin"
     fi
 }
 
-# Add aliases to shell rc
-add_aliases() {
-    detect_shell_rc
-
-    if grep -qF "$ALIAS_MARKER" "$SHELL_RC" 2>/dev/null; then
-        echo "Aliases already present in $SHELL_RC"
-        return 0
+# Find where pip installed the entry points
+find_mysqlpg_bin() {
+    local bin
+    bin="$(command -v mysqlpg 2>/dev/null || true)"
+    if [ -z "$bin" ]; then
+        # Try common pip locations
+        for dir in /usr/local/bin /usr/bin "$HOME/.local/bin"; do
+            if [ -x "$dir/mysqlpg" ]; then
+                bin="$dir/mysqlpg"
+                break
+            fi
+        done
     fi
-
-    cat >> "$SHELL_RC" << 'ALIASES'
-
-# mysqlpg aliases — MySQL-compatible CLI for PostgreSQL
-alias mysql='mysqlpg'
-alias mysqldump='mysqldumppg'
-ALIASES
-
-    echo "Added mysql/mysqldump aliases to $SHELL_RC"
-    echo "Run 'source $SHELL_RC' or restart your shell to activate."
+    echo "$bin"
 }
 
-# Remove aliases from shell rc
-remove_aliases() {
-    detect_shell_rc
+# Create symlinks: mysql -> mysqlpg, mysqldump -> mysqldumppg
+create_symlinks() {
+    local bin_dir
+    bin_dir="$(get_bin_dir)"
 
-    if [ ! -f "$SHELL_RC" ]; then
-        return 0
+    local mysqlpg_bin mysqldumppg_bin
+    mysqlpg_bin="$(find_mysqlpg_bin)"
+    mysqldumppg_bin="$(command -v mysqldumppg 2>/dev/null || true)"
+
+    if [ -z "$mysqlpg_bin" ]; then
+        echo "WARNING: mysqlpg not found in PATH. Skipping symlinks."
+        return 1
     fi
 
-    # Remove the alias block (marker line + 3 lines after)
-    if grep -qF "$ALIAS_MARKER" "$SHELL_RC" 2>/dev/null; then
-        # Use sed to remove the block: blank line before, marker, and two alias lines
-        sed -i '/^$/N;/\n# mysqlpg aliases/{N;N;d;}' "$SHELL_RC"
-        echo "Removed aliases from $SHELL_RC"
+    # Get the directory where pip installed the scripts
+    local pip_bin_dir
+    pip_bin_dir="$(dirname "$mysqlpg_bin")"
+
+    if [ -z "$mysqldumppg_bin" ] && [ -x "$pip_bin_dir/mysqldumppg" ]; then
+        mysqldumppg_bin="$pip_bin_dir/mysqldumppg"
     fi
+
+    # Check if real mysql/mysqldump already exist
+    local existing_mysql existing_dump
+    existing_mysql="$(command -v mysql 2>/dev/null || true)"
+    existing_dump="$(command -v mysqldump 2>/dev/null || true)"
+
+    # Create mysql symlink
+    if [ -n "$existing_mysql" ] && [ ! -L "$existing_mysql" ]; then
+        echo "WARNING: Real MySQL client found at $existing_mysql"
+        echo "  Skipping 'mysql' symlink to avoid conflict."
+        echo "  Use 'mysqlpg' directly instead."
+    else
+        if [ -L "$bin_dir/mysql" ]; then
+            rm "$bin_dir/mysql"
+        fi
+        ln -s "$mysqlpg_bin" "$bin_dir/mysql"
+        echo "Created symlink: $bin_dir/mysql -> $mysqlpg_bin"
+    fi
+
+    # Create mysqldump symlink
+    if [ -n "$existing_dump" ] && [ ! -L "$existing_dump" ]; then
+        echo "WARNING: Real mysqldump found at $existing_dump"
+        echo "  Skipping 'mysqldump' symlink to avoid conflict."
+        echo "  Use 'mysqldumppg' directly instead."
+    elif [ -n "$mysqldumppg_bin" ]; then
+        if [ -L "$bin_dir/mysqldump" ]; then
+            rm "$bin_dir/mysqldump"
+        fi
+        ln -s "$mysqldumppg_bin" "$bin_dir/mysqldump"
+        echo "Created symlink: $bin_dir/mysqldump -> $mysqldumppg_bin"
+    fi
+
+    # Ensure user bin dir is in PATH
+    if [ "$(id -u)" -ne 0 ] && [[ ":$PATH:" != *":$bin_dir:"* ]]; then
+        echo ""
+        echo "NOTE: $bin_dir is not in your PATH."
+        echo "  Add this to your shell profile:"
+        echo "    export PATH=\"$bin_dir:\$PATH\""
+    fi
+}
+
+# Remove symlinks
+remove_symlinks() {
+    local bin_dir
+    bin_dir="$(get_bin_dir)"
+
+    for name in mysql mysqldump; do
+        local target="$bin_dir/$name"
+        if [ -L "$target" ]; then
+            local dest
+            dest="$(readlink "$target")"
+            if [[ "$dest" == *mysqlpg* ]] || [[ "$dest" == *mysqldumppg* ]]; then
+                rm "$target"
+                echo "Removed symlink: $target"
+            fi
+        fi
+    done
+
+    # Also check /usr/local/bin if user is root
+    if [ "$(id -u)" -eq 0 ]; then
+        return
+    fi
+    for name in mysql mysqldump; do
+        local target="/usr/local/bin/$name"
+        if [ -L "$target" ]; then
+            local dest
+            dest="$(readlink "$target")"
+            if [[ "$dest" == *mysqlpg* ]] || [[ "$dest" == *mysqldumppg* ]]; then
+                rm "$target" 2>/dev/null || true
+                echo "Removed symlink: $target"
+            fi
+        fi
+    done
 }
 
 # Install the package
@@ -77,7 +155,7 @@ install() {
         exit 1
     fi
 
-    # Install in development mode (editable) or regular mode
+    # Install
     if [ -f "$SCRIPT_DIR/pyproject.toml" ]; then
         echo "Installing from source at $SCRIPT_DIR..."
         "$PYTHON" -m pip install -e "$SCRIPT_DIR" --quiet
@@ -88,12 +166,12 @@ install() {
 
     echo ""
     echo "Installed successfully!"
-    echo "  mysqlpg    — MySQL-compatible CLI for PostgreSQL"
+    echo "  mysqlpg     — MySQL-compatible CLI for PostgreSQL"
     echo "  mysqldumppg — mysqldump-compatible dump tool for PostgreSQL"
-    echo ""
 
-    # Verify installation
+    # Verify
     if command -v mysqlpg &>/dev/null; then
+        echo ""
         echo "Version: $(mysqlpg -V)"
     fi
 }
@@ -101,41 +179,44 @@ install() {
 # Uninstall
 uninstall() {
     echo "Uninstalling mysqlpg..."
+    remove_symlinks
     PYTHON="$(command -v python3 || command -v python)"
     "$PYTHON" -m pip uninstall mysqlpg -y 2>/dev/null || true
-    remove_aliases
-    echo "Uninstalled."
+    echo "Done."
 }
 
 # Main
 case "${1:-}" in
-    --no-alias)
+    --no-alias|--no-symlink)
         install
         ;;
     --uninstall)
         uninstall
         ;;
-    --alias-only)
-        add_aliases
+    --symlink-only|--alias-only)
+        create_symlinks
         ;;
     --help|-h)
-        echo "Usage: $0 [--no-alias|--uninstall|--alias-only|--help]"
+        echo "Usage: $0 [OPTIONS]"
         echo ""
-        echo "  (default)      Install mysqlpg and add mysql/mysqldump aliases"
-        echo "  --no-alias     Install without adding shell aliases"
-        echo "  --alias-only   Only add aliases (skip pip install)"
-        echo "  --uninstall    Remove package and aliases"
-        echo "  --help         Show this help"
+        echo "  (default)         Install mysqlpg and create mysql/mysqldump symlinks"
+        echo "  --no-alias        Install without creating symlinks"
+        echo "  --symlink-only    Only create symlinks (skip pip install)"
+        echo "  --uninstall       Remove package and symlinks"
+        echo "  --help            Show this help"
+        echo ""
+        echo "Symlinks are created in /usr/local/bin (root) or ~/.local/bin (user)."
+        echo "Existing mysql/mysqldump binaries are never overwritten."
         ;;
     *)
         install
         echo ""
-        read -p "Add 'mysql' and 'mysqldump' aliases to your shell? [Y/n] " -n 1 -r
+        read -p "Create 'mysql' and 'mysqldump' symlinks? [Y/n] " -n 1 -r
         echo ""
         if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            add_aliases
+            create_symlinks
         else
-            echo "Skipping aliases. You can add them later with: $0 --alias-only"
+            echo "Skipping symlinks. Create them later with: $0 --symlink-only"
         fi
         ;;
 esac

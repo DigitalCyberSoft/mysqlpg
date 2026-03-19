@@ -11,11 +11,25 @@ They also enable round-trip compatibility with MySQL dump files and pgloader mig
 ## Installation
 
 ```bash
+# Quick install with mysql/mysqldump symlinks
+./install.sh
+
+# Install without symlinks
+./install.sh --no-alias
+
+# Or install manually with pip
 pip install -e .
 
 # With test dependencies
 pip install -e ".[test]"
 ```
+
+The install script:
+- Installs the Python package via pip
+- Creates `mysql` -> `mysqlpg` and `mysqldump` -> `mysqldumppg` symlinks
+- Uses `/usr/local/bin` when run as root, `~/.local/bin` for regular users
+- Never overwrites existing MySQL binaries (warns and skips instead)
+- Supports `--uninstall` to cleanly remove everything
 
 Requires Python 3.8+ and a reachable PostgreSQL server.
 
