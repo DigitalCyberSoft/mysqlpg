@@ -140,8 +140,15 @@ def _translate_functions(sql):
         r'POSITION(\2 IN \1)', sql, flags=re.IGNORECASE
     )
 
-    # CHAR(n) → CHR(n) -- but not CHAR(n) as a type, only as function call
-    sql = re.sub(r'\bCHAR\s*\((\s*\d+\s*)\)', r'CHR(\1)', sql, flags=re.IGNORECASE)
+    # CHAR(n) → CHR(n) -- only as standalone function call, not in type context (AS CHAR)
+    def _rewrite_char(m):
+        # Check if preceded by AS (type context like CAST(x AS CHAR(100)))
+        start = m.start()
+        prefix = sql[max(0, start-4):start].strip().upper()
+        if prefix.endswith('AS'):
+            return m.group(0)  # keep as type
+        return f'CHR({m.group(1)})'
+    sql = re.sub(r'\bCHAR\s*\((\s*\d+\s*)\)', _rewrite_char, sql, flags=re.IGNORECASE)
 
     # SPACE(n) → REPEAT(' ', n)
     sql = re.sub(r'\bSPACE\s*\(([^)]+)\)', r"REPEAT(' ', \1)", sql, flags=re.IGNORECASE)
@@ -373,6 +380,130 @@ def _translate_functions(sql):
 
     # DATABASE() → current_database() (also in _TRANSLATORS but needed for inline)
     sql = re.sub(r'\bDATABASE\s*\(\s*\)', 'current_database()', sql, flags=re.IGNORECASE)
+
+    # --- NULL-safe equality ---
+    # <=> → IS NOT DISTINCT FROM
+    sql = re.sub(r'\s*<=>\s*', ' IS NOT DISTINCT FROM ', sql)
+
+    # --- FROM DUAL → strip ---
+    sql = re.sub(r'\bFROM\s+DUAL\b', '', sql, flags=re.IGNORECASE)
+
+    # --- SELECT modifiers to strip ---
+    # SQL_NO_CACHE, SQL_CACHE, SQL_BUFFER_RESULT, SQL_SMALL_RESULT, SQL_BIG_RESULT, HIGH_PRIORITY
+    for mod in ('SQL_NO_CACHE', 'SQL_CACHE', 'SQL_BUFFER_RESULT',
+                'SQL_SMALL_RESULT', 'SQL_BIG_RESULT', 'HIGH_PRIORITY'):
+        sql = re.sub(rf'\b{mod}\b\s*', '', sql, flags=re.IGNORECASE)
+
+    # --- CAST type translations ---
+    # CAST(x AS UNSIGNED) → CAST(x AS BIGINT)
+    sql = re.sub(r'\bCAST\s*\((.+?)\s+AS\s+UNSIGNED\s*\)',
+                 r'CAST(\1 AS BIGINT)', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bCAST\s*\((.+?)\s+AS\s+UNSIGNED\s+INTEGER\s*\)',
+                 r'CAST(\1 AS BIGINT)', sql, flags=re.IGNORECASE)
+    # CAST(x AS SIGNED) → CAST(x AS INTEGER)
+    sql = re.sub(r'\bCAST\s*\((.+?)\s+AS\s+SIGNED\s*\)',
+                 r'CAST(\1 AS INTEGER)', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bCAST\s*\((.+?)\s+AS\s+SIGNED\s+INTEGER\s*\)',
+                 r'CAST(\1 AS INTEGER)', sql, flags=re.IGNORECASE)
+    # CAST(x AS CHAR) → CAST(x AS TEXT) when no length specified
+    sql = re.sub(r'\bCAST\s*\((.+?)\s+AS\s+CHAR\s*\)',
+                 r'CAST(\1 AS TEXT)', sql, flags=re.IGNORECASE)
+    # CAST(x AS DATETIME) → CAST(x AS TIMESTAMP)
+    sql = re.sub(r'\bCAST\s*\((.+?)\s+AS\s+DATETIME\s*\)',
+                 r'CAST(\1 AS TIMESTAMP)', sql, flags=re.IGNORECASE)
+
+    # CONVERT(expr USING charset) → just the expr (charset handled by client_encoding)
+    # MUST be before CONVERT(expr, type) to avoid mis-matching
+    sql = re.sub(
+        r'\bCONVERT\s*\(\s*([^)]+?)\s+USING\s+\w+\s*\)',
+        r'\1', sql, flags=re.IGNORECASE
+    )
+
+    # CONVERT(expr, type) → CAST(expr AS type)
+    def _rewrite_convert(m):
+        expr = m.group(1).strip()
+        typ = m.group(2).strip()
+        type_map = {
+            'UNSIGNED': 'BIGINT', 'SIGNED': 'INTEGER',
+            'CHAR': 'TEXT', 'DATETIME': 'TIMESTAMP',
+        }
+        pg_type = type_map.get(typ.upper(), typ)
+        return f'CAST({expr} AS {pg_type})'
+    sql = re.sub(
+        r'\bCONVERT\s*\(\s*(.+?)\s*,\s*(\w+)\s*\)',
+        _rewrite_convert, sql, flags=re.IGNORECASE
+    )
+
+    # --- FIELD() → ARRAY_POSITION() ---
+    def _rewrite_field(m):
+        inner = m.group(1)
+        args = _split_args(inner)
+        if len(args) < 2:
+            return m.group(0)
+        val = args[0].strip()
+        elements = ', '.join(a.strip() for a in args[1:])
+        return f'ARRAY_POSITION(ARRAY[{elements}], {val})'
+    sql = re.sub(
+        r'\bFIELD\s*\(([^)]+)\)',
+        _rewrite_field, sql, flags=re.IGNORECASE
+    )
+
+    # --- ELT(n, s1, s2, ...) → (ARRAY[s1, s2, ...])[n] ---
+    def _rewrite_elt(m):
+        inner = m.group(1)
+        args = _split_args(inner)
+        if len(args) < 2:
+            return m.group(0)
+        idx = args[0].strip()
+        elements = ', '.join(a.strip() for a in args[1:])
+        return f'(ARRAY[{elements}])[{idx}]'
+    sql = re.sub(
+        r'\bELT\s*\(([^)]+)\)',
+        _rewrite_elt, sql, flags=re.IGNORECASE
+    )
+
+    # --- FIND_IN_SET(val, set_expr) → val = ANY(string_to_array(set_expr, ',')) ---
+    # Handles both FIND_IN_SET('val', 'a,b,c') and FIND_IN_SET('val', col)
+    def _rewrite_find_in_set(m):
+        val = m.group(1).strip()
+        set_expr = m.group(2).strip()
+        return f"{val} = ANY(string_to_array({set_expr}, ','))"
+    sql = re.sub(
+        r"\bFIND_IN_SET\s*\(\s*(.+?)\s*,\s*([^)]+)\s*\)",
+        _rewrite_find_in_set, sql, flags=re.IGNORECASE
+    )
+
+    # --- SOUNDS LIKE → SOUNDEX comparison (requires fuzzystrmatch) ---
+    sql = re.sub(
+        r'\b(\w+)\s+SOUNDS\s+LIKE\s+',
+        r'SOUNDEX(\1) = SOUNDEX(', sql, flags=re.IGNORECASE
+    )
+
+    # --- MariaDB MINUS → EXCEPT ---
+    sql = re.sub(r'\bMINUS\b(?!\s*\()', 'EXCEPT', sql, flags=re.IGNORECASE)
+
+    # --- Index hints: USE INDEX / FORCE INDEX / IGNORE INDEX → strip ---
+    sql = re.sub(
+        r'\b(?:USE|FORCE|IGNORE)\s+INDEX\s*(?:\s+FOR\s+(?:JOIN|ORDER\s+BY|GROUP\s+BY))?\s*\([^)]*\)',
+        '', sql, flags=re.IGNORECASE
+    )
+
+    # --- WITH ROLLUP → ROLLUP() ---
+    # GROUP BY a, b WITH ROLLUP → GROUP BY ROLLUP(a, b)
+    def _rewrite_with_rollup(m):
+        cols = m.group(1).strip()
+        return f'GROUP BY ROLLUP({cols})'
+    sql = re.sub(
+        r'\bGROUP\s+BY\s+(.+?)\s+WITH\s+ROLLUP\b',
+        _rewrite_with_rollup, sql, flags=re.IGNORECASE
+    )
+
+    # --- STRCMP(s1, s2) → CASE comparison ---
+    sql = re.sub(
+        r'\bSTRCMP\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
+        r'CASE WHEN \1 < \2 THEN -1 WHEN \1 > \2 THEN 1 ELSE 0 END',
+        sql, flags=re.IGNORECASE
+    )
 
     # Backtick conversion
     sql = _convert_backticks(sql)
@@ -1126,6 +1257,44 @@ def _set_session_var(m, conn, sql):
     return _noop_ok(m, conn, sql)
 
 
+def _insert_set_syntax(m, conn, sql):
+    """Translate MySQL INSERT ... SET col=val to standard INSERT INTO ... VALUES."""
+    table = m.group("table").strip("`'\"")
+    set_clause = m.group("set_clause").strip()
+
+    # Parse SET col1=val1, col2=val2
+    cols = []
+    vals = []
+    for part in _split_args(set_clause):
+        part = part.strip()
+        eq_m = re.match(r'([`\"\w]+)\s*=\s*(.*)', part, re.DOTALL)
+        if eq_m:
+            cols.append(eq_m.group(1).strip("`'\""))
+            vals.append(eq_m.group(2).strip())
+
+    if not cols:
+        return _convert_backticks(sql), False
+
+    col_list = ', '.join(f'"{c}"' for c in cols)
+    val_list = ', '.join(vals)
+    return _convert_backticks(f'INSERT INTO "{table}" ({col_list}) VALUES ({val_list})'), False
+
+
+def _do_statement(m, conn, sql):
+    """Translate MySQL DO expr → SELECT expr (discard result)."""
+    expr = m.group("expr").strip()
+    # Common DO usages: DO SLEEP(n) → SELECT pg_sleep(n)
+    expr = re.sub(r'\bSLEEP\s*\(', 'pg_sleep(', expr, flags=re.IGNORECASE)
+    return f"SELECT {expr}", False
+
+
+def _use_index_hint(m, conn, sql):
+    """Strip MySQL/MariaDB USE/FORCE/IGNORE INDEX hints."""
+    # These appear inline in FROM clause: ... FROM t USE INDEX (idx) WHERE ...
+    # Strip the hint, keep everything else
+    return None  # Fall through to general translation
+
+
 # --- pgloader compatibility ---
 
 def _create_type_enum(m, conn, sql):
@@ -1662,6 +1831,12 @@ _TRANSLATORS = [
     (re.compile(r"SET\s+(?:SESSION\s+)?(?:wait_timeout|interactive_timeout|net_\w+)\s*=", _i),
      _set_session_var),
 
+    # INSERT ... SET syntax (MySQL/MariaDB only) → standard INSERT
+    (re.compile(
+        r"INSERT\s+INTO\s+(?P<table>[`\"\w.]+)\s+SET\s+(?P<set_clause>.+)",
+        _i | re.DOTALL
+    ), _insert_set_syntax),
+
     # INSERT IGNORE
     (re.compile(
         r"INSERT\s+IGNORE\s+INTO\s+(?P<table>[`\"\w.]+)\s+(?P<rest>.*)",
@@ -1757,6 +1932,9 @@ _TRANSLATORS = [
 
     # FLUSH PRIVILEGES
     (re.compile(r"FLUSH\s+PRIVILEGES\s*$", _i), _flush_privileges),
+
+    # DO statement (MySQL: DO expr → PG: SELECT expr)
+    (re.compile(r"DO\s+(?P<expr>.+)", _i), _do_statement),
 
     # KILL [QUERY] pid
     (re.compile(r"KILL\s+(?P<query>QUERY\s+)?(?P<pid>\d+)\s*$", _i), _kill),
