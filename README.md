@@ -57,8 +57,14 @@ mysqldumppg -u postgres mydb > backup.sql
 # Restore from dump
 mysqlpg -u postgres mydb < backup.sql
 
-# Round-trip: dump and restore to another database
-mysqldumppg -u postgres sourcedb | mysqlpg -u postgres targetdb
+# Migrate a MySQL dump file to PostgreSQL
+mysqlpg-migrate --from-dump mysql_backup.sql --to-pg postgres://user@localhost/mydb
+
+# Migrate from a live MySQL server
+mysqlpg-migrate --from-mysql mysql://root:pass@mysqlhost/app --to-pg postgres://user@pghost/app
+
+# Preview migration without executing
+mysqlpg-migrate --from-dump backup.sql --dry-run
 ```
 
 ---
@@ -287,6 +293,98 @@ mysqlpg can load MySQL dump files directly. The following MySQL dump statements 
 
 ---
 
+## mysqlpg-migrate
+
+Full MySQL → PostgreSQL migration tool. Translates MySQL dump files (or live MySQL databases) to PostgreSQL-compatible SQL and executes them.
+
+### Quick Start
+
+```bash
+# Migrate from a MySQL dump file into PostgreSQL
+mysqlpg-migrate --from-dump backup.sql --to-pg postgres://user@localhost/mydb
+
+# Dry run: show translated SQL without executing
+mysqlpg-migrate --from-dump backup.sql --dry-run
+
+# Generate a PG-compatible SQL file from a MySQL dump
+mysqlpg-migrate --from-dump backup.sql --to-file converted.sql
+
+# Migrate from a live MySQL server (requires mysqldump on PATH)
+mysqlpg-migrate --from-mysql mysql://root:pass@mysqlhost/mydb --to-pg postgres://user@pghost/mydb
+
+# Schema-only migration (review before loading data)
+mysqlpg-migrate --from-dump backup.sql --to-pg postgres://user@host/db --schema-only
+
+# Data-only migration (schema already exists)
+mysqlpg-migrate --from-dump backup.sql --to-pg postgres://user@host/db --data-only
+
+# Create target database automatically
+mysqlpg-migrate --from-dump backup.sql --to-pg postgres://user@host/newdb --create-db
+
+# Migrate specific tables only
+mysqlpg-migrate --from-dump backup.sql --to-pg postgres://user@host/db --tables users posts
+
+# Validate after migration (check row counts)
+mysqlpg-migrate --from-dump backup.sql --to-pg postgres://user@host/db --validate
+
+# Wrap in a single transaction (rollback on any error)
+mysqlpg-migrate --from-dump backup.sql --to-pg postgres://user@host/db --single-transaction
+```
+
+### Migration Options
+
+**Source (pick one):**
+
+| Flag | Description |
+|------|-------------|
+| `--from-dump FILE` | MySQL dump file (`.sql` or `.sql.gz`) |
+| `--from-mysql URL` | Live MySQL: `mysql://user:pass@host/dbname` |
+
+**Target (pick one):**
+
+| Flag | Description |
+|------|-------------|
+| `--to-pg URL` | PostgreSQL: `postgres://user:pass@host/dbname` |
+| `--to-file FILE` | Write translated SQL to file |
+| `--dry-run` | Print translated SQL to stdout |
+
+**PG connection (alternative to URL):**
+
+`--pg-host`, `--pg-port`, `--pg-user`, `--pg-password`, `--pg-database` (defaults from `$PG*` env vars)
+
+**Migration mode:**
+
+| Flag | Description |
+|------|-------------|
+| `--schema-only` | DDL only (CREATE TABLE, indexes) |
+| `--data-only` | INSERTs only (schema must exist) |
+| `--create-db` | Create target database if missing |
+| `--tables T1 T2` | Migrate only these tables |
+| `--exclude-tables T1` | Skip these tables |
+| `--single-transaction` | Wrap in one transaction |
+| `--validate` | Check row counts after migration |
+| `--force` | Continue on errors |
+| `--verbose` | Detailed progress output |
+
+### What It Does
+
+1. Reads MySQL dump (from file or `mysqldump` of a live server)
+2. Parses into individual statements, handling DELIMITER changes, conditional comments, and quoted strings
+3. Classifies each statement (schema/data/control/routine)
+4. Translates each to PostgreSQL using the full translator engine
+5. Disables FK checks, executes schema → data → routines, re-enables FK checks
+6. Optionally validates row counts
+
+### Supported Input Formats
+
+- Plain `.sql` files from `mysqldump`
+- Gzip-compressed `.sql.gz` files
+- Live MySQL via `mysqldump` (must be on PATH)
+- Files with `DELIMITER` changes (stored procedures)
+- Files with `/*!NNNNN ... */` conditional comments
+
+---
+
 ## mysqldumppg
 
 ### CLI Flags
@@ -476,6 +574,9 @@ python -m pytest tests/ -k "not Live and not RoundTrip and not Enum"
 | `test_dumpcli.py` | Dump tool | Parser, options, value formatting, table sorting, INSERT generation |
 | `test_interactive.py` | REPL features | Autocomplete, prompt expansion, keyword list |
 | `test_pgloader.py` | pgloader compat | CREATE TYPE, DISABLE TRIGGER, COPY, setval, zero dates |
+| `test_pgloader_data.py` | pgloader fixtures | Real SQL from pgloader's test suite |
+| `test_dml.py` | DML translation | NULL-safe equality, CAST, CONVERT, FIELD, ELT, INSERT SET, DO |
+| `test_migrate.py` | Migration tool | URL parsing, statement splitting, dry-run, classification |
 | `test_roundtrip.py` | Integration | Full dump->restore workflows (requires live PG) |
 
 ### Test Requirements

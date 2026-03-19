@@ -182,6 +182,29 @@ def run_interactive(conn, formatter, state, args):
                 pass
             state["rehash"] = False
 
+        # Handle commands that work without a delimiter (exit, quit, \q, etc.)
+        stripped_line = line.strip().rstrip(";").strip()
+        stripped_upper = stripped_line.upper()
+        if not buffer and stripped_upper in ("EXIT", "QUIT", "\\Q"):
+            formatter.print_message("Bye")
+            state["exit"] = True
+            return
+        if not buffer and stripped_upper in ("CLEAR", "\\C"):
+            continue
+        # Handle USE, STATUS, HELP etc. without delimiter when on a single line
+        if not buffer and stripped_line:
+            # Check if it's a meta-command that doesn't need delimiter
+            if handle_command(stripped_line, conn, formatter, state):
+                if state.get("exit"):
+                    return
+                if state.get("rehash"):
+                    try:
+                        completer.refresh(conn)
+                    except Exception:
+                        pass
+                    state["rehash"] = False
+                continue
+
         # Check for \G at end of line
         vertical_override = False
         stripped_line = line.rstrip()

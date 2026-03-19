@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mysqlpg"
-version = "0.1.1"
+version = "0.1.2"
 description = "MySQL-compatible CLI tools for PostgreSQL"
 requires-python = ">=3.8"
 dependencies = [
@@ -16,6 +16,7 @@ dependencies = [
 [project.scripts]
 mysqlpg = "mysqlpg.cli:main"
 mysqldumppg = "mysqlpg.dumpcli:main"
+mysqlpg-migrate = "mysqlpg.migrate:main"
 
 [project.optional-dependencies]
 test = [
