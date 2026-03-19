@@ -39,6 +39,15 @@ SQL_KEYWORDS = [
     "SHOW FULL COLUMNS FROM", "SHOW CHARACTER SET", "SHOW COLLATION",
     "INSERT IGNORE INTO", "REPLACE INTO", "ON DUPLICATE KEY UPDATE",
     "KILL", "KILL QUERY", "TRUNCATE TABLE", "RENAME TABLE",
+    # psql backslash commands
+    "\\dt", "\\dt+", "\\d", "\\d+", "\\di", "\\dn", "\\du", "\\dv", "\\ds", "\\df",
+    "\\l", "\\l+", "\\x", "\\conninfo", "\\timing", "\\i", "\\o", "\\?",
+    # PG-specific SQL
+    "EXPLAIN ANALYZE", "EXPLAIN (ANALYZE, BUFFERS)",
+    "COPY", "RETURNING", "LATERAL", "MATERIALIZED VIEW",
+    "WITH RECURSIVE", "ON CONFLICT", "DO UPDATE SET", "DO NOTHING",
+    "FOR UPDATE SKIP LOCKED", "FOR UPDATE NOWAIT", "FOR SHARE",
+    "FETCH FIRST", "ROWS ONLY",
 ]
 
 
