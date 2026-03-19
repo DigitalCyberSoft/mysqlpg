@@ -140,10 +140,86 @@ mysqldumppg -u postgres sourcedb | mysqlpg -u postgres targetdb
 
 #### Function Translation
 
+**String Functions:**
+
 | MySQL | PostgreSQL |
 |-------|-----------|
-| `DATABASE()` | `current_database()` |
+| `GROUP_CONCAT(col SEPARATOR ',')` | `STRING_AGG(col::text, ',')` |
+| `GROUP_CONCAT(DISTINCT col ORDER BY col)` | `STRING_AGG(DISTINCT col::text, ',' ORDER BY col)` |
+| `LOCATE(substr, str)` | `POSITION(substr IN str)` |
+| `INSTR(str, substr)` | `POSITION(substr IN str)` |
+| `CHAR(n)` | `CHR(n)` |
+| `SPACE(n)` | `REPEAT(' ', n)` |
+| `HEX(s)` | `ENCODE(s::bytea, 'hex')` |
+| `UNHEX(s)` | `DECODE(s, 'hex')` |
 | `IFNULL(a, b)` | `COALESCE(a, b)` |
+
+**Numeric Functions:**
+
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `RAND()` | `RANDOM()` |
+| `TRUNCATE(n, d)` | `TRUNC(n, d)` |
+| `LOG(n)` | `LN(n)` (natural log) |
+| `LOG(base, n)` | `LOG(base, n)` (identical) |
+| `LOG2(n)` | `LOG(2, n)` |
+| `LOG10(n)` | `LOG(10, n)` |
+
+**Date/Time Functions:**
+
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `DATE_FORMAT(col, '%Y-%m-%d')` | `TO_CHAR(col, 'YYYY-MM-DD')` |
+| `STR_TO_DATE(s, '%Y-%m-%d')` | `TO_TIMESTAMP(s, 'YYYY-MM-DD')` |
+| `DATE_ADD(col, INTERVAL 7 DAY)` | `col + INTERVAL '7 DAY'` |
+| `DATE_SUB(col, INTERVAL 30 DAY)` | `col - INTERVAL '30 DAY'` |
+| `DATEDIFF(d1, d2)` | `d1::date - d2::date` |
+| `UNIX_TIMESTAMP()` | `EXTRACT(EPOCH FROM NOW())` |
+| `UNIX_TIMESTAMP(col)` | `EXTRACT(EPOCH FROM col)` |
+| `FROM_UNIXTIME(n)` | `TO_TIMESTAMP(n)` |
+| `CURDATE()` | `CURRENT_DATE` |
+| `CURTIME()` | `CURRENT_TIME` |
+| `SYSDATE()` | `CLOCK_TIMESTAMP()` |
+| `YEAR(col)` / `MONTH(col)` / `DAY(col)` | `EXTRACT(YEAR/MONTH/DAY FROM col)` |
+| `HOUR(col)` / `MINUTE(col)` / `SECOND(col)` | `EXTRACT(HOUR/MINUTE/SECOND FROM col)` |
+| `DAYOFWEEK(col)` | `EXTRACT(DOW FROM col) + 1` |
+| `DAYOFYEAR(col)` | `EXTRACT(DOY FROM col)` |
+| `WEEK(col)` / `WEEKOFYEAR(col)` | `EXTRACT(WEEK FROM col)` |
+| `LAST_DAY(col)` | `(DATE_TRUNC('month', col) + INTERVAL '1 month' - INTERVAL '1 day')::date` |
+| `DATE(col)` | `col::date` |
+| `TIME(col)` | `col::time` |
+
+**Conditional & Info Functions:**
+
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `IF(cond, true, false)` | `CASE WHEN cond THEN true ELSE false END` |
+| `ISNULL(col)` | `col IS NULL` |
+| `DATABASE()` | `current_database()` |
+| `USER()` | `current_user` |
+| `VERSION()` | `version()` |
+| `LAST_INSERT_ID()` | `lastval()` |
+
+**Regex Operators:**
+
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `col REGEXP 'pattern'` | `col ~* 'pattern'` |
+| `col RLIKE 'pattern'` | `col ~* 'pattern'` |
+| `col NOT REGEXP 'pattern'` | `col !~* 'pattern'` |
+
+**Query Syntax:**
+
+| MySQL | PostgreSQL |
+|-------|-----------|
+| `LIMIT 20, 10` (offset, count) | `LIMIT 10 OFFSET 20` |
+| `LOCK IN SHARE MODE` | `FOR SHARE` |
+| `STRAIGHT_JOIN` | `JOIN` (hint stripped) |
+| `INSERT LOW_PRIORITY/DELAYED` | `INSERT` (modifier stripped) |
+| `SQL_CALC_FOUND_ROWS` | Stripped (use `COUNT(*) OVER()`) |
+| `UPDATE t1 JOIN t2 ON ... SET ...` | `UPDATE t1 SET ... FROM t2 WHERE ...` |
+| `DELETE t1 FROM t1 JOIN t2 ...` | `DELETE FROM t1 USING t2 WHERE ...` |
+| `LOAD DATA INFILE '/path'` | `COPY table FROM '/path' WITH (FORMAT csv)` |
 
 #### User Management
 
@@ -390,7 +466,8 @@ python -m pytest tests/ -k "not Live and not RoundTrip and not Enum"
 
 | Module | Tests | Description |
 |--------|-------|-------------|
-| `test_translator.py` | SQL translation | SHOW commands, DML, DDL, functions, user mgmt, pgloader compat, type mapping |
+| `test_translator.py` | SQL translation | SHOW commands, DML, DDL, user mgmt, pgloader compat, type mapping |
+| `test_functions.py` | Function translation | String, numeric, date/time, conditional, regex, query modifiers, UPDATE/DELETE JOIN |
 | `test_formatter.py` | Output formatting | Table, batch, vertical modes; cell formatting; tee/pager |
 | `test_cli.py` | CLI arg parsing | Password handling, flag combinations, database resolution |
 | `test_commands.py` | Meta-commands | USE, STATUS, SOURCE, TEE, PAGER, DELIMITER, EXIT, etc. |
