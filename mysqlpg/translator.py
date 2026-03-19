@@ -230,10 +230,22 @@ def _translate_functions(sql):
     sql = re.sub(r'\bFROM_UNIXTIME\s*\(([^)]+)\)', r'TO_TIMESTAMP(\1)', sql, flags=re.IGNORECASE)
 
     # DATEDIFF(date1, date2) → (date1::date - date2::date)
-    sql = re.sub(
-        r'\bDATEDIFF\s*\(\s*([^,]+?)\s*,\s*([^)]+)\s*\)',
-        r'((\1)::date - (\2)::date)', sql, flags=re.IGNORECASE
-    )
+    # Uses loop + _find_matching_paren to handle nested function calls
+    while True:
+        m = re.search(r'\bDATEDIFF\s*\(', sql, re.IGNORECASE)
+        if not m:
+            break
+        paren_pos = sql.index('(', m.start())
+        end = _find_matching_paren(sql, paren_pos)
+        if end < 0:
+            break
+        inner = sql[paren_pos+1:end]
+        args = _split_args(inner)
+        if len(args) == 2:
+            replacement = f'(({args[0].strip()})::date - ({args[1].strip()})::date)'
+            sql = sql[:m.start()] + replacement + sql[end+1:]
+        else:
+            break
 
     # DATE_ADD(date, INTERVAL n unit) → (date + INTERVAL 'n unit')
     def _rewrite_date_add(m):
@@ -306,11 +318,17 @@ def _translate_functions(sql):
     )
 
     # LAST_DAY(col) → (DATE_TRUNC('month', col) + INTERVAL '1 month' - INTERVAL '1 day')::date
-    sql = re.sub(
-        r'\bLAST_DAY\s*\(([^)]+)\)',
-        r"(DATE_TRUNC('month', \1) + INTERVAL '1 month' - INTERVAL '1 day')::date",
-        sql, flags=re.IGNORECASE
-    )
+    while True:
+        m = re.search(r'\bLAST_DAY\s*\(', sql, re.IGNORECASE)
+        if not m:
+            break
+        paren_pos = sql.index('(', m.start())
+        end = _find_matching_paren(sql, paren_pos)
+        if end < 0:
+            break
+        arg = sql[paren_pos+1:end].strip()
+        replacement = f"(DATE_TRUNC('month', {arg}) + INTERVAL '1 month' - INTERVAL '1 day')::date"
+        sql = sql[:m.start()] + replacement + sql[end+1:]
 
     # DATE(col) → (col)::date
     sql = re.sub(r'\bDATE\s*\(([^)]+)\)', r'(\1)::date', sql, flags=re.IGNORECASE)
