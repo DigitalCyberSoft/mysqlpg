@@ -20,11 +20,17 @@ def translate(sql, conn):
         if m:
             result = handler(m, conn, stripped)
             if result is None:
-                break  # Fall through to backtick conversion
+                break  # Fall through to general translation
+            # Apply function translation to non-special results
+            if not result[1]:  # not is_special
+                translated = _translate_functions(result[0])
+                translated = _fix_zero_dates(translated)
+                return translated, False
             return result
 
-    # No special translation — backtick conversion + zero-date fix
+    # No special translation — full pipeline
     converted = _convert_backticks(sql)
+    converted = _translate_functions(converted)
     converted = _fix_zero_dates(converted)
     return converted, False
 
@@ -36,6 +42,375 @@ def _fix_zero_dates(sql):
     # '0000-00-00' → NULL
     sql = re.sub(r"'0000-00-00'", "NULL", sql)
     return sql
+
+
+# --- MySQL date format → PG TO_CHAR format mapping ---
+_MYSQL_TO_PG_DATE_FORMAT = {
+    '%Y': 'YYYY', '%y': 'YY', '%m': 'MM', '%c': 'FMMM',
+    '%M': 'Month', '%b': 'Mon', '%d': 'DD', '%e': 'FMDD',
+    '%H': 'HH24', '%h': 'HH12', '%I': 'HH12',
+    '%i': 'MI', '%s': 'SS', '%S': 'SS', '%p': 'AM',
+    '%W': 'Day', '%a': 'Dy', '%j': 'DDD', '%V': 'IW',
+    '%f': 'US', '%T': 'HH24:MI:SS', '%r': 'HH12:MI:SS AM',
+}
+
+
+def _convert_date_format(mysql_fmt):
+    """Convert MySQL DATE_FORMAT format string to PG TO_CHAR format string."""
+    result = mysql_fmt
+    # Sort by length descending to avoid partial replacements
+    for mysql_spec, pg_spec in sorted(_MYSQL_TO_PG_DATE_FORMAT.items(),
+                                       key=lambda x: -len(x[0])):
+        result = result.replace(mysql_spec, pg_spec)
+    return result
+
+
+def _find_matching_paren(sql, start):
+    """Find the matching closing parenthesis for the one at position start."""
+    depth = 0
+    in_sq = False
+    in_dq = False
+    for i in range(start, len(sql)):
+        ch = sql[i]
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+        elif ch == '"' and not in_sq:
+            in_dq = not in_dq
+        elif not in_sq and not in_dq:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+    return -1
+
+
+def _translate_functions(sql):
+    """Translate MySQL-specific functions and syntax to PostgreSQL equivalents.
+
+    This runs on all SQL that passes through to PG, handling inline function
+    calls and MySQL-specific syntax patterns.
+    """
+    if not sql or not sql.strip():
+        return sql
+
+    # --- String functions ---
+
+    # GROUP_CONCAT(col SEPARATOR ',') → STRING_AGG(col::text, ',')
+    # GROUP_CONCAT(col ORDER BY x SEPARATOR ',') → STRING_AGG(col::text, ',' ORDER BY x)
+    # GROUP_CONCAT(DISTINCT col SEPARATOR ',') → STRING_AGG(DISTINCT col::text, ',')
+    def _rewrite_group_concat(m):
+        inner = m.group(1).strip()
+        # Parse: [DISTINCT] expr [ORDER BY ...] [SEPARATOR 'sep']
+        distinct = ''
+        if re.match(r'DISTINCT\s+', inner, re.IGNORECASE):
+            distinct = 'DISTINCT '
+            inner = re.sub(r'^DISTINCT\s+', '', inner, flags=re.IGNORECASE)
+
+        sep = ","  # default separator
+        sep_m = re.search(r"\bSEPARATOR\s+'([^']*)'", inner, re.IGNORECASE)
+        if sep_m:
+            sep = sep_m.group(1)
+            inner = inner[:sep_m.start()].strip()
+
+        order_by = ''
+        order_m = re.search(r'\bORDER\s+BY\s+(.+)', inner, re.IGNORECASE)
+        if order_m:
+            order_by = ' ORDER BY ' + order_m.group(1).strip()
+            inner = inner[:order_m.start()].strip()
+
+        expr = inner.strip().rstrip(',')
+        return f"STRING_AGG({distinct}{expr}::text, '{sep}'{order_by})"
+
+    sql = re.sub(
+        r'\bGROUP_CONCAT\s*\(([^)]*(?:\([^)]*\))*[^)]*)\)',
+        _rewrite_group_concat, sql, flags=re.IGNORECASE
+    )
+
+    # LOCATE(substr, str) → POSITION(substr IN str)
+    sql = re.sub(
+        r'\bLOCATE\s*\(\s*([^,]+?)\s*,\s*([^,)]+)\s*\)',
+        r'POSITION(\1 IN \2)', sql, flags=re.IGNORECASE
+    )
+
+    # INSTR(str, substr) → POSITION(substr IN str)  [args reversed]
+    sql = re.sub(
+        r'\bINSTR\s*\(\s*([^,]+?)\s*,\s*([^,)]+)\s*\)',
+        r'POSITION(\2 IN \1)', sql, flags=re.IGNORECASE
+    )
+
+    # CHAR(n) → CHR(n) -- but not CHAR(n) as a type, only as function call
+    sql = re.sub(r'\bCHAR\s*\((\s*\d+\s*)\)', r'CHR(\1)', sql, flags=re.IGNORECASE)
+
+    # SPACE(n) → REPEAT(' ', n)
+    sql = re.sub(r'\bSPACE\s*\(([^)]+)\)', r"REPEAT(' ', \1)", sql, flags=re.IGNORECASE)
+
+    # HEX(s) → ENCODE(s::bytea, 'hex')
+    sql = re.sub(r'\bHEX\s*\(([^)]+)\)', r"ENCODE((\1)::bytea, 'hex')", sql, flags=re.IGNORECASE)
+
+    # UNHEX(s) → DECODE(s, 'hex')
+    sql = re.sub(r'\bUNHEX\s*\(([^)]+)\)', r"DECODE(\1, 'hex')", sql, flags=re.IGNORECASE)
+
+    # --- Numeric functions ---
+
+    # RAND() → RANDOM()
+    sql = re.sub(r'\bRAND\s*\(\s*\)', 'RANDOM()', sql, flags=re.IGNORECASE)
+
+    # TRUNCATE(n, d) → TRUNC(n, d)  -- careful: not TRUNCATE TABLE
+    sql = re.sub(r'\bTRUNCATE\s*\(([^,]+),\s*([^)]+)\)', r'TRUNC(\1, \2)', sql, flags=re.IGNORECASE)
+
+    # LOG(n) with one arg → LN(n) in MySQL (natural log)
+    # LOG(base, n) with two args → LOG(base, n) in PG (same)
+    # We only convert single-arg LOG to LN
+    def _rewrite_log(m):
+        inner = m.group(1)
+        # Check if there's a comma (two args)
+        if ',' in inner:
+            return f'LOG({inner})'  # two-arg: keep as LOG
+        return f'LN({inner})'  # one-arg: MySQL LOG = natural log = PG LN
+    sql = re.sub(r'\bLOG\s*\(([^)]+)\)', _rewrite_log, sql, flags=re.IGNORECASE)
+
+    # LOG2(n) → LOG(2, n)
+    sql = re.sub(r'\bLOG2\s*\(([^)]+)\)', r'LOG(2, \1)', sql, flags=re.IGNORECASE)
+
+    # LOG10(n) → LOG(10, n)  -- PG LOG() is base-10, but explicit is clearer
+    sql = re.sub(r'\bLOG10\s*\(([^)]+)\)', r'LOG(10, \1)', sql, flags=re.IGNORECASE)
+
+    # --- Date/Time functions ---
+
+    # DATE_FORMAT(col, 'fmt') → TO_CHAR(col, 'pg_fmt')
+    def _rewrite_date_format(m):
+        expr = m.group(1).strip()
+        fmt = m.group(2)
+        pg_fmt = _convert_date_format(fmt)
+        return f"TO_CHAR({expr}, '{pg_fmt}')"
+    sql = re.sub(
+        r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'([^']*)'\s*\)",
+        _rewrite_date_format, sql, flags=re.IGNORECASE
+    )
+
+    # STR_TO_DATE(str, fmt) → TO_TIMESTAMP(str, pg_fmt)
+    def _rewrite_str_to_date(m):
+        expr = m.group(1).strip()
+        fmt = m.group(2)
+        pg_fmt = _convert_date_format(fmt)
+        return f"TO_TIMESTAMP({expr}, '{pg_fmt}')"
+    sql = re.sub(
+        r"\bSTR_TO_DATE\s*\(\s*(.+?)\s*,\s*'([^']*)'\s*\)",
+        _rewrite_str_to_date, sql, flags=re.IGNORECASE
+    )
+
+    # CURDATE() → CURRENT_DATE
+    sql = re.sub(r'\bCURDATE\s*\(\s*\)', 'CURRENT_DATE', sql, flags=re.IGNORECASE)
+
+    # CURTIME() → CURRENT_TIME
+    sql = re.sub(r'\bCURTIME\s*\(\s*\)', 'CURRENT_TIME', sql, flags=re.IGNORECASE)
+
+    # SYSDATE() → CLOCK_TIMESTAMP()
+    sql = re.sub(r'\bSYSDATE\s*\(\s*\)', 'CLOCK_TIMESTAMP()', sql, flags=re.IGNORECASE)
+
+    # UNIX_TIMESTAMP() → EXTRACT(EPOCH FROM NOW())
+    sql = re.sub(r'\bUNIX_TIMESTAMP\s*\(\s*\)', "EXTRACT(EPOCH FROM NOW())::bigint", sql, flags=re.IGNORECASE)
+
+    # UNIX_TIMESTAMP(col) → EXTRACT(EPOCH FROM col)
+    sql = re.sub(
+        r'\bUNIX_TIMESTAMP\s*\(([^)]+)\)',
+        r'EXTRACT(EPOCH FROM \1)::bigint', sql, flags=re.IGNORECASE
+    )
+
+    # FROM_UNIXTIME(n) → TO_TIMESTAMP(n)
+    sql = re.sub(r'\bFROM_UNIXTIME\s*\(([^)]+)\)', r'TO_TIMESTAMP(\1)', sql, flags=re.IGNORECASE)
+
+    # DATEDIFF(date1, date2) → (date1::date - date2::date)
+    sql = re.sub(
+        r'\bDATEDIFF\s*\(\s*([^,]+?)\s*,\s*([^)]+)\s*\)',
+        r'((\1)::date - (\2)::date)', sql, flags=re.IGNORECASE
+    )
+
+    # DATE_ADD(date, INTERVAL n unit) → (date + INTERVAL 'n unit')
+    def _rewrite_date_add(m):
+        expr = m.group(1).strip()
+        interval = m.group(2).strip()
+        return f"({expr} + {interval})"
+    sql = re.sub(
+        r'\bDATE_ADD\s*\(\s*(.+?)\s*,\s*(INTERVAL\s+.+?)\s*\)',
+        _rewrite_date_add, sql, flags=re.IGNORECASE
+    )
+
+    # DATE_SUB(date, INTERVAL n unit) → (date - INTERVAL 'n unit')
+    def _rewrite_date_sub(m):
+        expr = m.group(1).strip()
+        interval = m.group(2).strip()
+        return f"({expr} - {interval})"
+    sql = re.sub(
+        r'\bDATE_SUB\s*\(\s*(.+?)\s*,\s*(INTERVAL\s+.+?)\s*\)',
+        _rewrite_date_sub, sql, flags=re.IGNORECASE
+    )
+
+    # YEAR(col) → EXTRACT(YEAR FROM col)
+    for unit in ('YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND'):
+        sql = re.sub(
+            rf'\b{unit}\s*\(([^)]+)\)',
+            rf'EXTRACT({unit} FROM \1)',
+            sql, flags=re.IGNORECASE
+        )
+
+    # DAYOFWEEK(col) → EXTRACT(DOW FROM col) + 1  (MySQL: 1=Sunday, PG DOW: 0=Sunday)
+    sql = re.sub(
+        r'\bDAYOFWEEK\s*\(([^)]+)\)',
+        r'(EXTRACT(DOW FROM \1) + 1)',
+        sql, flags=re.IGNORECASE
+    )
+
+    # DAYOFMONTH(col) → EXTRACT(DAY FROM col)
+    sql = re.sub(
+        r'\bDAYOFMONTH\s*\(([^)]+)\)',
+        r'EXTRACT(DAY FROM \1)',
+        sql, flags=re.IGNORECASE
+    )
+
+    # DAYOFYEAR(col) → EXTRACT(DOY FROM col)
+    sql = re.sub(
+        r'\bDAYOFYEAR\s*\(([^)]+)\)',
+        r'EXTRACT(DOY FROM \1)',
+        sql, flags=re.IGNORECASE
+    )
+
+    # WEEKOFYEAR(col) / WEEK(col) → EXTRACT(WEEK FROM col)
+    sql = re.sub(
+        r'\bWEEKOFYEAR\s*\(([^)]+)\)',
+        r'EXTRACT(WEEK FROM \1)',
+        sql, flags=re.IGNORECASE
+    )
+    sql = re.sub(
+        r'\bWEEK\s*\(([^)]+)\)',
+        r'EXTRACT(WEEK FROM \1)',
+        sql, flags=re.IGNORECASE
+    )
+
+    # LAST_DAY(col) → (DATE_TRUNC('month', col) + INTERVAL '1 month' - INTERVAL '1 day')::date
+    sql = re.sub(
+        r'\bLAST_DAY\s*\(([^)]+)\)',
+        r"(DATE_TRUNC('month', \1) + INTERVAL '1 month' - INTERVAL '1 day')::date",
+        sql, flags=re.IGNORECASE
+    )
+
+    # DATE(col) → (col)::date
+    sql = re.sub(r'\bDATE\s*\(([^)]+)\)', r'(\1)::date', sql, flags=re.IGNORECASE)
+
+    # TIME(col) → (col)::time
+    sql = re.sub(r'\bTIME\s*\(([^)]+)\)', r'(\1)::time', sql, flags=re.IGNORECASE)
+
+    # --- Conditional functions ---
+
+    # IF(cond, true, false) → CASE WHEN cond THEN true ELSE false END
+    def _rewrite_if(m):
+        # Simple case: IF(a, b, c) with no nested parens
+        inner = m.group(1)
+        parts = _split_args(inner)
+        if len(parts) == 3:
+            return f"CASE WHEN {parts[0].strip()} THEN {parts[1].strip()} ELSE {parts[2].strip()} END"
+        return m.group(0)  # can't parse, leave as-is
+    sql = re.sub(
+        r'\bIF\s*\((.+?)\)(?=[\s,;)"\']|$)',
+        _rewrite_if, sql, flags=re.IGNORECASE
+    )
+
+    # ISNULL(col) → (col IS NULL)
+    sql = re.sub(r'\bISNULL\s*\(([^)]+)\)', r'(\1 IS NULL)', sql, flags=re.IGNORECASE)
+
+    # --- Information functions ---
+
+    # USER() → current_user
+    sql = re.sub(r'\bUSER\s*\(\s*\)', 'current_user', sql, flags=re.IGNORECASE)
+
+    # VERSION() → version()
+    sql = re.sub(r'\bVERSION\s*\(\s*\)', 'version()', sql, flags=re.IGNORECASE)
+
+    # LAST_INSERT_ID() → lastval()
+    sql = re.sub(r'\bLAST_INSERT_ID\s*\(\s*\)', 'lastval()', sql, flags=re.IGNORECASE)
+
+    # FOUND_ROWS() → strip (no PG equivalent; warn via comment)
+    sql = re.sub(r'\bFOUND_ROWS\s*\(\s*\)', '0 /* FOUND_ROWS() not supported */', sql, flags=re.IGNORECASE)
+
+    # SQL_CALC_FOUND_ROWS → strip
+    sql = re.sub(r'\bSQL_CALC_FOUND_ROWS\b', '/* SQL_CALC_FOUND_ROWS removed */', sql, flags=re.IGNORECASE)
+
+    # --- Regex operators ---
+
+    # NOT REGEXP → !~* (case-insensitive by default like MySQL)
+    sql = re.sub(r'\bNOT\s+REGEXP\b', '!~*', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bNOT\s+RLIKE\b', '!~*', sql, flags=re.IGNORECASE)
+
+    # REGEXP / RLIKE → ~* (case-insensitive like MySQL default)
+    sql = re.sub(r'\bREGEXP\b', '~*', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bRLIKE\b', '~*', sql, flags=re.IGNORECASE)
+
+    # --- Query modifiers to strip ---
+
+    # STRAIGHT_JOIN → strip (keep as regular JOIN-like query)
+    sql = re.sub(r'\bSTRAIGHT_JOIN\b', 'JOIN', sql, flags=re.IGNORECASE)
+
+    # INSERT LOW_PRIORITY/DELAYED/HIGH_PRIORITY → strip modifier
+    sql = re.sub(r'\bINSERT\s+(LOW_PRIORITY|DELAYED|HIGH_PRIORITY)\s+', 'INSERT ', sql, flags=re.IGNORECASE)
+
+    # LOCK IN SHARE MODE → FOR SHARE
+    sql = re.sub(r'\bLOCK\s+IN\s+SHARE\s+MODE\b', 'FOR SHARE', sql, flags=re.IGNORECASE)
+
+    # --- LIMIT offset,count → LIMIT count OFFSET offset ---
+    def _rewrite_limit_comma(m):
+        offset = m.group(1).strip()
+        count = m.group(2).strip()
+        return f"LIMIT {count} OFFSET {offset}"
+    sql = re.sub(
+        r'\bLIMIT\s+(\d+)\s*,\s*(\d+)',
+        _rewrite_limit_comma, sql, flags=re.IGNORECASE
+    )
+
+    # IFNULL → COALESCE (also done in _TRANSLATORS but needed here for passthrough)
+    sql = re.sub(r'\bIFNULL\s*\(', 'COALESCE(', sql, flags=re.IGNORECASE)
+
+    # DATABASE() → current_database() (also in _TRANSLATORS but needed for inline)
+    sql = re.sub(r'\bDATABASE\s*\(\s*\)', 'current_database()', sql, flags=re.IGNORECASE)
+
+    # Backtick conversion
+    sql = _convert_backticks(sql)
+
+    return sql
+
+
+def _split_args(s):
+    """Split function arguments respecting parentheses and quotes."""
+    parts = []
+    depth = 0
+    current = []
+    in_sq = False
+    in_dq = False
+    for ch in s:
+        if ch == "'" and not in_dq:
+            in_sq = not in_sq
+            current.append(ch)
+        elif ch == '"' and not in_sq:
+            in_dq = not in_dq
+            current.append(ch)
+        elif not in_sq and not in_dq:
+            if ch == '(':
+                depth += 1
+                current.append(ch)
+            elif ch == ')':
+                depth -= 1
+                current.append(ch)
+            elif ch == ',' and depth == 0:
+                parts.append(''.join(current))
+                current = []
+            else:
+                current.append(ch)
+        else:
+            current.append(ch)
+    if current:
+        parts.append(''.join(current))
+    return parts
 
 
 def _convert_backticks(sql):
@@ -704,6 +1079,53 @@ def _set_autocommit(m, conn, sql):
     return sql, False
 
 
+# --- Statement-level translations ---
+
+def _update_join(m, conn, sql):
+    """Translate MySQL UPDATE ... JOIN ... SET to PG UPDATE ... FROM."""
+    table1 = m.group("table1").strip("`'\"")
+    table2 = m.group("table2").strip("`'\"")
+    on_clause = m.group("on_clause").strip()
+    set_clause = m.group("set_clause").strip()
+    where = m.group("where")
+
+    set_clean = re.sub(rf'\b{re.escape(table1)}\s*\.', '', set_clause)
+    result = f'UPDATE "{table1}" SET {set_clean} FROM "{table2}" WHERE {on_clause}'
+    if where:
+        result += f' AND {where.strip()}'
+    return _convert_backticks(result), False
+
+
+def _delete_join(m, conn, sql):
+    """Translate MySQL DELETE ... JOIN to PG DELETE ... USING."""
+    table1 = m.group("table1").strip("`'\"")
+    table2 = m.group("table2").strip("`'\"")
+    on_clause = m.group("on_clause").strip()
+    where = m.group("where")
+
+    result = f'DELETE FROM "{table1}" USING "{table2}" WHERE {on_clause}'
+    if where:
+        result += f' AND {where.strip()}'
+    return _convert_backticks(result), False
+
+
+def _load_data_infile(m, conn, sql):
+    """Translate LOAD DATA INFILE → COPY ... FROM."""
+    filepath = m.group("filepath")
+    table = m.group("table").strip("`'\"")
+    return f"COPY \"{table}\" FROM '{filepath}' WITH (FORMAT csv, HEADER)", False
+
+
+def _set_sql_mode(m, conn, sql):
+    """SET sql_mode → no-op (PG is always strict)."""
+    return _noop_ok(m, conn, sql)
+
+
+def _set_session_var(m, conn, sql):
+    """Handle various SET SESSION/GLOBAL variables as no-ops."""
+    return _noop_ok(m, conn, sql)
+
+
 # --- pgloader compatibility ---
 
 def _create_type_enum(m, conn, sql):
@@ -1201,6 +1623,44 @@ _TRANSLATORS = [
 
     # SHOW CREATE DATABASE
     (re.compile(r"SHOW\s+CREATE\s+DATABASE\s+(?P<db>[`\"\w]+)\s*$", _i), _show_create_database),
+
+    # --- Statement-level translations ---
+
+    # UPDATE ... JOIN ... SET ... WHERE → UPDATE ... SET ... FROM ... WHERE
+    (re.compile(
+        r"UPDATE\s+(?P<table1>[`\"\w.]+)\s+"
+        r"(?:(?P<join_type>INNER|LEFT|RIGHT|CROSS)\s+)?JOIN\s+(?P<table2>[`\"\w.]+)\s+"
+        r"ON\s+(?P<on_clause>.+?)\s+"
+        r"SET\s+(?P<set_clause>.+?)"
+        r"(?:\s+WHERE\s+(?P<where>.+))?$",
+        _i | re.DOTALL
+    ), _update_join),
+
+    # DELETE t1 FROM t1 JOIN t2 ON ... WHERE → DELETE FROM t1 USING t2 WHERE
+    (re.compile(
+        r"DELETE\s+[`\"\w.]+\s+FROM\s+(?P<table1>[`\"\w.]+)\s+"
+        r"(?:(?:INNER|LEFT|RIGHT|CROSS)\s+)?JOIN\s+(?P<table2>[`\"\w.]+)\s+"
+        r"ON\s+(?P<on_clause>.+?)"
+        r"(?:\s+WHERE\s+(?P<where>.+))?$",
+        _i | re.DOTALL
+    ), _delete_join),
+
+    # LOAD DATA INFILE
+    (re.compile(
+        r"LOAD\s+DATA\s+(?:LOCAL\s+)?INFILE\s+'(?P<filepath>[^']+)'\s+"
+        r"INTO\s+TABLE\s+(?P<table>[`\"\w.]+)",
+        _i
+    ), _load_data_infile),
+
+    # SET sql_mode → no-op
+    (re.compile(r"SET\s+(?:SESSION\s+|GLOBAL\s+)?sql_mode\s*=", _i), _set_sql_mode),
+
+    # SET SESSION/@@session variables → no-op
+    (re.compile(r"SET\s+@@(?:session|global)\.\w+\s*=", _i), _set_session_var),
+
+    # SET wait_timeout / interactive_timeout / net_* → no-op
+    (re.compile(r"SET\s+(?:SESSION\s+)?(?:wait_timeout|interactive_timeout|net_\w+)\s*=", _i),
+     _set_session_var),
 
     # INSERT IGNORE
     (re.compile(
