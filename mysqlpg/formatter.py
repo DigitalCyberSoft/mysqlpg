@@ -1,6 +1,7 @@
 """MySQL-style output formatting: bordered tables, batch, vertical."""
 
 import os
+import shlex
 import subprocess
 import sys
 
@@ -202,7 +203,7 @@ class Formatter:
         if self.pager_cmd and sys.stdout.isatty():
             try:
                 proc = subprocess.Popen(
-                    self.pager_cmd, shell=True, stdin=subprocess.PIPE,
+                    shlex.split(self.pager_cmd), stdin=subprocess.PIPE,
                     encoding="utf-8"
                 )
                 proc.communicate(input=text)

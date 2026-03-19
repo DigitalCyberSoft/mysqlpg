@@ -494,6 +494,33 @@ mysqlpg/
 
 ---
 
+## Security Considerations
+
+### Passwords on the command line
+
+The `-pSECRET` syntax (password as argument) is visible in process listings (`ps aux`). Prefer:
+- `-p` (prompted, no echo)
+- `PGPASSWORD` environment variable
+- `~/.pgpass` file (handled by libpq/psycopg2)
+
+### SOURCE command
+
+`SOURCE file` reads and executes SQL from arbitrary filesystem paths. Only source files you trust. Untrusted SQL files could contain destructive statements.
+
+### SYSTEM command
+
+`SYSTEM cmd` (or `\! cmd`) executes shell commands. This mirrors MySQL's behavior. Commands are parsed with `shlex.split()` (no shell expansion). Only available in the REPL and `-e` mode — use with the same caution as any shell access.
+
+### --where flag
+
+The `--where` flag in mysqldumppg passes the value directly as a SQL WHERE clause, matching mysqldump's behavior. Do not use with untrusted input.
+
+### SQL translation
+
+The translator uses regex-based pattern matching. While capture groups restrict input to safe character classes (e.g., table names are `[\w.\`"]+`, LIKE patterns exclude single quotes), the generated SQL uses string interpolation rather than parameterized queries in some SHOW command handlers. This is safe for interactive use but means you should not pipe arbitrary untrusted input through mysqlpg without review.
+
+---
+
 ## Environment Variables
 
 | Variable | Description |

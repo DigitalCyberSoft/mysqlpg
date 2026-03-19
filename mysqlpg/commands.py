@@ -1,6 +1,7 @@
 """Meta-command handling (USE, STATUS, SOURCE, TEE, etc.)."""
 
 import os
+import shlex
 import subprocess
 import sys
 import re
@@ -46,7 +47,7 @@ def handle_command(sql, conn, formatter, state):
     if m:
         cmd = m.group(1)
         try:
-            subprocess.run(cmd, shell=True)
+            subprocess.run(shlex.split(cmd))
         except Exception as e:
             formatter.print_message(f"ERROR: {e}")
         return True
