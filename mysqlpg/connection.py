@@ -39,6 +39,18 @@ class Connection:
         self.server_version = self.conn.server_version
         self.conn.notices = []
 
+        # Ensure public schema is always in search_path (MySQL has no schemas)
+        cur = self.conn.cursor()
+        try:
+            cur.execute("SELECT current_setting('search_path')")
+            current_path = cur.fetchone()[0]
+            if 'public' not in current_path.split(','):
+                cur.execute(f"SET search_path TO {current_path}, public")
+        except Exception:
+            pass
+        finally:
+            cur.close()
+
         # Set up notice handler
         self.notices = []
 
