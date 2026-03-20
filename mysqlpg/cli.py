@@ -91,7 +91,7 @@ def main():
     args = parser.parse_args(argv)
 
     # Resolve database
-    database = args.database or args.dbname or os.environ.get("PGDATABASE")
+    database = args.database or args.dbname or os.environ.get("PGDATABASE") or "postgres"
 
     # Handle password prompt
     password = args.password

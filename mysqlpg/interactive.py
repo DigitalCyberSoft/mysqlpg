@@ -142,6 +142,7 @@ def run_interactive(conn, formatter, state, args):
         except Exception:
             pass
 
+    os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
     session = PromptSession(
         history=FileHistory(history_file),
         auto_suggest=AutoSuggestFromHistory(),

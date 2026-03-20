@@ -381,6 +381,10 @@ def _translate_functions(sql):
     sql = re.sub(r'\bREGEXP\b', '~*', sql, flags=re.IGNORECASE)
     sql = re.sub(r'\bRLIKE\b', '~*', sql, flags=re.IGNORECASE)
 
+    # --- LIKE → ILIKE (MySQL LIKE is case-insensitive by default) ---
+    sql = re.sub(r'\bNOT\s+LIKE\b', 'NOT ILIKE', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'(?<!\bSOUNDS\s)\bLIKE\b', 'ILIKE', sql, flags=re.IGNORECASE)
+
     # --- Query modifiers to strip ---
 
     # STRAIGHT_JOIN → strip (keep as regular JOIN-like query)
@@ -608,7 +612,7 @@ def _show_databases(m, conn, sql):
     like = m.group("like")
     q = "SELECT datname AS \"Database\" FROM pg_database WHERE datistemplate = false"
     if like:
-        q += f" AND datname LIKE '{like}'"
+        q += f" AND datname ILIKE '{like}'"
     q += " ORDER BY datname"
     return q, False
 
@@ -640,7 +644,7 @@ def _show_tables(m, conn, sql):
         )
 
     if like:
-        q += f" AND table_name LIKE '{like}'"
+        q += f" AND table_name ILIKE '{like}'"
     q += " ORDER BY table_name"
     return q, False
 
@@ -744,7 +748,7 @@ def _show_full_columns(m, conn, sql):
     WHERE c.table_name = '{table}' AND c.table_schema = 'public'
     """
     if like:
-        q += f" AND c.column_name LIKE '{like}'"
+        q += f" AND c.column_name ILIKE '{like}'"
     q += " ORDER BY c.ordinal_position"
     return q, False
 
@@ -826,7 +830,7 @@ def _show_table_status(m, conn, sql):
       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
     """
     if like:
-        q += f" AND c.relname LIKE '{like}'"
+        q += f" AND c.relname ILIKE '{like}'"
     q += " ORDER BY c.relname"
     # Simplify - just get basic info
     q = """
@@ -855,7 +859,7 @@ def _show_table_status(m, conn, sql):
       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
     """
     if like:
-        q += f" AND c.relname LIKE '{like}'"
+        q += f" AND c.relname ILIKE '{like}'"
     q += " ORDER BY c.relname"
     return q, False
 
@@ -889,7 +893,7 @@ def _show_variables(m, conn, sql):
     like = m.group("like")
     q = 'SELECT name AS "Variable_name", setting AS "Value" FROM pg_settings'
     if like:
-        q += f" WHERE name LIKE '{like}'"
+        q += f" WHERE name ILIKE '{like}'"
     q += " ORDER BY name"
     return q, False
 
@@ -922,7 +926,7 @@ def _show_status(m, conn, sql):
         """
 
     if like:
-        q = f"SELECT * FROM ({q}) sub WHERE \"Variable_name\" LIKE '{like}'"
+        q = f"SELECT * FROM ({q}) sub WHERE \"Variable_name\" ILIKE '{like}'"
     return q, False
 
 
@@ -1001,7 +1005,7 @@ def _show_collation(m, conn, sql):
     WHERE collnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'pg_catalog')
     """
     if like:
-        q += f" AND collname LIKE '{like}'"
+        q += f" AND collname ILIKE '{like}'"
     q += " ORDER BY collname"
     return q, False
 
